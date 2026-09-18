@@ -1,0 +1,83 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
+*.code-workspace
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Environment / Secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# Project Data
+# =========================
+
+# Raw datasets
+raw/
+
+# Generated outputs
+output/
+
+pretrained/
+
+
+# Graph outputs
+graphs/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Testing
+# =========================
+.pytest_cache/
+.coverage
+htmlcov/
+.coverage.*
+
+# =========================
+# Build
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.temp
+*.bak
