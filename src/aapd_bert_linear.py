@@ -317,9 +317,7 @@ def encode_labels(
 # BERT + Multi-Label Classifier
 # ============================================================
 
-class BertMultiLabelClassifier(
-    nn.Module
-):
+class BertMultiLabelClassifier(nn.Module):
 
     def __init__(
         self,
@@ -342,28 +340,23 @@ class BertMultiLabelClassifier(
         # ----------------------------------------------------
 
         for param in self.bert.parameters():
-
             param.requires_grad = False
 
         # ----------------------------------------------------
         # BERT hidden size
         # ----------------------------------------------------
 
-        hidden_size = (
-            self.bert.config.hidden_size
-        )
+        hidden_size = self.bert.config.hidden_size
 
         # ----------------------------------------------------
-        # Trainable classifier
+        # Two-layer trainable classifier
         # ----------------------------------------------------
 
-        self.dropout = nn.Dropout(
-            0.1
-        )
-
-        self.classifier = nn.Linear(
-            hidden_size,
-            num_labels,
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, num_labels),
         )
 
     # ========================================================
@@ -391,24 +384,17 @@ class BertMultiLabelClassifier(
         # CLS embedding
         # ----------------------------------------------------
 
-        cls_embedding = (
-            outputs.last_hidden_state[:, 0]
-        )
+        cls_embedding = outputs.last_hidden_state[:, 0]
 
         # ----------------------------------------------------
-        # Classifier
+        # Two-layer classifier
         # ----------------------------------------------------
-
-        cls_embedding = self.dropout(
-            cls_embedding
-        )
 
         logits = self.classifier(
             cls_embedding
         )
 
         return logits
-
 
 # ============================================================
 # Save checkpoint
