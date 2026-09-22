@@ -347,15 +347,25 @@ class FastTextClassifier(nn.Module):
 
         super().__init__()
 
-        self.classifier = nn.Linear(
-            embedding_dim,
-            num_labels
+        self.classifier = nn.Sequential(
+            nn.Linear(
+                embedding_dim,
+                256
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(0.1),
+
+            nn.Linear(
+                256,
+                num_labels
+            )
         )
 
     def forward(self, x):
 
         return self.classifier(x)
-
 
 # ============================================================
 # Model
