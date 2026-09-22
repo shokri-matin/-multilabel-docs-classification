@@ -280,37 +280,30 @@ class XLNetClassifier(nn.Module):
         model_name,
         num_labels
     ):
-
         super().__init__()
-
-        # ----------------------------------------------------
-        # Pretrained XLNet
-        # ----------------------------------------------------
 
         self.xlnet = XLNetModel.from_pretrained(
             model_name
         )
 
-        # ----------------------------------------------------
         # Freeze XLNet
-        # ----------------------------------------------------
-
         for parameter in self.xlnet.parameters():
             parameter.requires_grad = False
 
         hidden_size = self.xlnet.config.d_model
 
-        # ----------------------------------------------------
-        # Classification Head
-        # ----------------------------------------------------
-
-        self.dropout = nn.Dropout(
-            0.1
-        )
-
-        self.classifier = nn.Linear(
-            hidden_size,
-            num_labels
+        # Two-layer classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(
+                hidden_size,
+                256
+            ),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(
+                256,
+                num_labels
+            )
         )
 
     def forward(
@@ -319,10 +312,6 @@ class XLNetClassifier(nn.Module):
         attention_mask
     ):
 
-        # ----------------------------------------------------
-        # XLNet forward
-        # ----------------------------------------------------
-
         outputs = self.xlnet(
             input_ids=input_ids,
             attention_mask=attention_mask
@@ -330,22 +319,7 @@ class XLNetClassifier(nn.Module):
 
         hidden_states = outputs.last_hidden_state
 
-        # ----------------------------------------------------
-        # Use the last valid token representation
-        #
-        # XLNet uses <cls> as the final token for sequence
-        # classification.
-        # ----------------------------------------------------
-
         cls_representation = hidden_states[:, -1, :]
-
-        # ----------------------------------------------------
-        # Classification
-        # ----------------------------------------------------
-
-        cls_representation = self.dropout(
-            cls_representation
-        )
 
         logits = self.classifier(
             cls_representation
