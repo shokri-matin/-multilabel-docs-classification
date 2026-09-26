@@ -181,7 +181,7 @@ def preprocess_text(text):
             continue
 
         # Porter stemming
-        token = STEMMER.stem(token)
+        # token = STEMMER.stem(token)
 
         if token:
             processed_tokens.append(token)

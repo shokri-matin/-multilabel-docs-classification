@@ -53,7 +53,7 @@ LEARNING_RATE = 1e-3
 
 THRESHOLD = 0.25
 
-MAX_TRAIN_BATCHES = 5
+MAX_TRAIN_BATCHES = None
 # Example for testing:
 # MAX_TRAIN_BATCHES = 5
 
@@ -172,53 +172,34 @@ print("\nNumber of labels:", NUM_LABELS)
 # FastText Document Encoder
 # ============================================================
 
+MAX_LENGTH = 128
 
-def document_vector(text):
+
+def document_vector_sequence(text):
     """
-    Create a document embedding using mean pooling
-    over pretrained FastText word embeddings.
+    Convert a document into a sequence of pretrained FastText
+    word embeddings.
+
+    Output shape:
+        [MAX_LENGTH, embedding_dim]
+
+    FastText itself is NOT trained.
     """
 
     words = text.split()
 
-    if not words:
-        return np.zeros(
-            fasttext_model.vector_size,
-            dtype=np.float32
-        )
+    embedding_dim = fasttext_model.vector_size
 
-    vectors = [
-        fasttext_model.get_vector(word)
-        for word in words
-    ]
+    sequence = np.zeros(
+        (MAX_LENGTH, embedding_dim),
+        dtype=np.float32
+    )
 
-    return np.mean(
-        vectors,
-        axis=0
-    ).astype(np.float32)
+    for i, word in enumerate(words[:MAX_LENGTH]):
 
-# def document_vector(text):
-#     """
-#     Convert a document into a 300-dimensional
-#     pretrained FastText vector.
+        sequence[i] = fasttext_model.get_vector(word)
 
-#     FastText itself is NOT trained.
-#     """
-
-#     if not text.strip():
-#         return np.zeros(
-#             fasttext_model.vector_size,
-#             dtype=np.float32
-#         )
-
-#     vector = fasttext_model.get_vector(
-#         text
-#     )
-
-#     return np.asarray(
-#         vector,
-#         dtype=np.float32
-#     )
+    return sequence
 
 
 # ============================================================
@@ -230,11 +211,13 @@ def prepare_dataset(data):
     X = []
     Y = []
 
-    print("\nCreating FastText document vectors...")
+    print(
+        "\nCreating FastText document sequences..."
+    )
 
     for row in tqdm(data):
 
-        vector = document_vector(
+        sequence = document_vector_sequence(
             row["text"]
         )
 
@@ -251,7 +234,7 @@ def prepare_dataset(data):
                     label_to_id[label]
                 ] = 1.0
 
-        X.append(vector)
+        X.append(sequence)
         Y.append(target)
 
     X = np.asarray(
@@ -276,11 +259,25 @@ X_test, y_test = prepare_dataset(
 )
 
 
-print("\nTrain X shape:", X_train.shape)
-print("Train y shape:", y_train.shape)
+print(
+    "\nTrain X shape:",
+    X_train.shape
+)
 
-print("Test X shape:", X_test.shape)
-print("Test y shape:", y_test.shape)
+print(
+    "Train y shape:",
+    y_train.shape
+)
+
+print(
+    "Test X shape:",
+    X_test.shape
+)
+
+print(
+    "Test y shape:",
+    y_test.shape
+)
 
 
 # ============================================================
@@ -336,28 +333,51 @@ test_loader = torch.utils.data.DataLoader(
 
 
 # ============================================================
-# Classifier
+# Multi-Kernel Text CNN Classifier
 # ============================================================
 
-class FastTextClassifier(nn.Module):
+class FastTextCNNClassifier(nn.Module):
 
     def __init__(
         self,
         embedding_dim,
-        num_labels
+        num_labels,
+        num_filters=128,
+        kernel_sizes=(3, 4, 5),
+        dropout=0.3
     ):
 
         super().__init__()
 
+        self.kernel_sizes = kernel_sizes
+
+        self.convs = nn.ModuleList(
+            [
+                nn.Conv2d(
+                    in_channels=1,
+                    out_channels=num_filters,
+                    kernel_size=(kernel_size, embedding_dim)
+                )
+                for kernel_size in kernel_sizes
+            ]
+        )
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
         self.classifier = nn.Sequential(
+
             nn.Linear(
-                embedding_dim,
+                num_filters * len(kernel_sizes),
                 256
             ),
 
             nn.ReLU(),
 
-            nn.Dropout(0.1),
+            nn.Dropout(
+                dropout
+            ),
 
             nn.Linear(
                 256,
@@ -366,8 +386,58 @@ class FastTextClassifier(nn.Module):
         )
 
     def forward(self, x):
+        """
+        Input:
+            x = [batch, sequence_length, embedding_dim]
+
+        Example:
+            [64, 128, 300]
+
+        After unsqueeze:
+            [64, 1, 128, 300]
+
+        Each convolution uses:
+            3 x 300
+            4 x 300
+            5 x 300
+        """
+
+        x = x.unsqueeze(1)
+
+        pooled_outputs = []
+
+        for conv in self.convs:
+
+            # [batch, filters, sequence_length-k+1, 1]
+            feature = torch.relu(
+                conv(x)
+            )
+
+            # Remove embedding-width dimension.
+            # [batch, filters, sequence_length-k+1]
+            feature = feature.squeeze(3)
+
+            # Global max pooling over sequence.
+            # [batch, filters]
+            pooled = torch.max(
+                feature,
+                dim=2
+            ).values
+
+            pooled_outputs.append(
+                pooled
+            )
+
+        # [batch, filters * number_of_kernels]
+        x = torch.cat(
+            pooled_outputs,
+            dim=1
+        )
+
+        x = self.dropout(x)
 
         return self.classifier(x)
+
 
 # ============================================================
 # Model
@@ -375,14 +445,24 @@ class FastTextClassifier(nn.Module):
 
 EMBEDDING_DIM = fasttext_model.vector_size
 
-model = FastTextClassifier(
+model = FastTextCNNClassifier(
     embedding_dim=EMBEDDING_DIM,
-    num_labels=NUM_LABELS
+    num_labels=NUM_LABELS,
+    num_filters=128,
+    kernel_sizes=(3, 4, 5),
+    dropout=0.3
 ).to(DEVICE)
 
 
 print("\nModel:")
 print(model)
+
+print("\nCNN Configuration:")
+print("MAX_LENGTH:", MAX_LENGTH)
+print("FastText embedding dimension:", EMBEDDING_DIM)
+print("CNN kernels:", "(3x300), (4x300), (5x300)")
+print("CNN filters per kernel:", 128)
+print("CNN dropout:", 0.3)
 
 
 # ============================================================
@@ -776,6 +856,10 @@ for epoch in range(1, EPOCHS + 1):
                 "embedding_dim": EMBEDDING_DIM,
                 "num_labels": NUM_LABELS,
                 "threshold": THRESHOLD,
+                "max_length": MAX_LENGTH,
+                "num_filters": 128,
+                "kernel_sizes": (3, 4, 5),
+                "dropout": 0.3,
             },
             best_model_path
         )
@@ -804,7 +888,8 @@ print("=" * 70)
 
 best_checkpoint = torch.load(
     best_model_path,
-    map_location=DEVICE
+    map_location=DEVICE,
+    weights_only=False
 )
 
 model.load_state_dict(
