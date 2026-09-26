@@ -1,7 +1,10 @@
-
 from pathlib import Path
 
 import csv
+import json
+import shutil
+
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
@@ -35,19 +38,13 @@ MODEL_NAME = "bert-base-uncased"
 # ------------------------------------------------------------
 
 BATCH_SIZE = 16
-
 EPOCHS = 10
 
-# ------------------------------------------------------------
-# Maximum TOTAL training batches
+# Maximum TOTAL training batches.
 #
-# Example:
-#
-# 500  -> stop after 500 batches in total
-# 1000 -> stop after 1000 batches in total
-# None -> train for all batches in all epochs
-# ------------------------------------------------------------
-
+# None -> train all batches in all epochs.
+# 5    -> useful for a quick test, but only the first 5 batches
+#         are trained in total, so later epochs will not train.
 MAX_TRAIN_BATCHES = 5
 
 LEARNING_RATE = 2e-5
@@ -64,19 +61,33 @@ THRESHOLD = 0.5
 
 MAX_LENGTH = 32
 
+# ------------------------------------------------------------
+# Best-model selection
+#
+# NOTE:
+# The current script has only train/test CSV files, so TEST_CSV
+# is evaluated after every epoch and is used for model selection.
+# For a rigorous final experiment, use a separate validation CSV
+# for BEST_METRIC selection and keep TEST_CSV for final evaluation.
+# ------------------------------------------------------------
 
-# ============================================================
-# Checkpoint directory
-# ============================================================
+BEST_METRIC = "macro_f1"
+BEST_MODE = "max"
+
+# ------------------------------------------------------------
+# Output
+# ------------------------------------------------------------
 
 CHECKPOINT_DIR = Path(
     "output/models/bert_aapd"
 )
 
-CHECKPOINT_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+METRICS_DIR = CHECKPOINT_DIR / "metrics"
+PLOTS_DIR = CHECKPOINT_DIR / "plots"
+
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+METRICS_DIR.mkdir(parents=True, exist_ok=True)
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
@@ -99,11 +110,9 @@ def discover_labels(csv_file):
     Discover all labels from the training CSV.
 
     Expected CSV schema:
-
         docid,sec,label
 
     Example:
-
         2286,some document text,E11|ECAT
     """
 
@@ -129,7 +138,6 @@ def discover_labels(csv_file):
         )
 
         if missing_columns:
-
             raise ValueError(
                 f"Missing CSV columns: "
                 f"{sorted(missing_columns)}"
@@ -156,9 +164,7 @@ def discover_labels(csv_file):
 # ============================================================
 
 def count_csv_rows(csv_file):
-    """
-    Count the number of data rows in a CSV file.
-    """
+    """Count the number of data rows in a CSV file."""
 
     with csv_file.open(
         "r",
@@ -182,9 +188,7 @@ def count_batches(
     csv_file,
     batch_size,
 ):
-    """
-    Count the total number of batches in a CSV file.
-    """
+    """Count the total number of batches in a CSV file."""
 
     row_count = count_csv_rows(
         csv_file
@@ -209,7 +213,6 @@ def read_batches(
     Read CSV in batches.
 
     Expected CSV schema:
-
         docid,sec,label
     """
 
@@ -236,7 +239,6 @@ def read_batches(
         )
 
         if missing_columns:
-
             raise ValueError(
                 f"Missing CSV columns: "
                 f"{sorted(missing_columns)}"
@@ -259,12 +261,8 @@ def read_batches(
                 texts = []
                 labels = []
 
-        # ----------------------------------------------------
         # Last incomplete batch
-        # ----------------------------------------------------
-
         if texts:
-
             yield texts, labels
 
 
@@ -277,10 +275,7 @@ def encode_labels(
     label_to_id,
     num_labels,
 ):
-    """
-    Convert pipe-separated labels
-    into multi-hot vectors.
-    """
+    """Convert pipe-separated labels into multi-hot vectors."""
 
     target = torch.zeros(
         len(labels),
@@ -298,7 +293,6 @@ def encode_labels(
                 continue
 
             if label not in label_to_id:
-
                 raise ValueError(
                     f"Unknown label: {label}"
                 )
@@ -327,31 +321,18 @@ class BertMultiLabelClassifier(nn.Module):
 
         super().__init__()
 
-        # ----------------------------------------------------
         # Load pretrained BERT
-        # ----------------------------------------------------
-
         self.bert = AutoModel.from_pretrained(
             model_name
         )
 
-        # ----------------------------------------------------
-        # FREEZE BERT
-        # ----------------------------------------------------
-
+        # Freeze BERT
         for param in self.bert.parameters():
             param.requires_grad = False
 
-        # ----------------------------------------------------
-        # BERT hidden size
-        # ----------------------------------------------------
-
         hidden_size = self.bert.config.hidden_size
 
-        # ----------------------------------------------------
         # Two-layer trainable classifier
-        # ----------------------------------------------------
-
         self.classifier = nn.Sequential(
             nn.Linear(hidden_size, 256),
             nn.ReLU(),
@@ -359,20 +340,13 @@ class BertMultiLabelClassifier(nn.Module):
             nn.Linear(256, num_labels),
         )
 
-    # ========================================================
-    # Forward
-    # ========================================================
-
     def forward(
         self,
         input_ids,
         attention_mask,
     ):
 
-        # ----------------------------------------------------
         # BERT is frozen
-        # ----------------------------------------------------
-
         with torch.no_grad():
 
             outputs = self.bert(
@@ -380,21 +354,18 @@ class BertMultiLabelClassifier(nn.Module):
                 attention_mask=attention_mask,
             )
 
-        # ----------------------------------------------------
         # CLS embedding
-        # ----------------------------------------------------
+        cls_embedding = (
+            outputs.last_hidden_state[:, 0]
+        )
 
-        cls_embedding = outputs.last_hidden_state[:, 0]
-
-        # ----------------------------------------------------
-        # Two-layer classifier
-        # ----------------------------------------------------
-
+        # Classifier
         logits = self.classifier(
             cls_embedding
         )
 
         return logits
+
 
 # ============================================================
 # Save checkpoint
@@ -408,22 +379,21 @@ def save_checkpoint(
     total_batches,
     average_loss,
     labels,
+    checkpoint_dir,
+    extra_state=None,
 ):
     """
     Save:
-
-    1. Frozen pretrained BERT
-    2. Tokenizer
-    3. Trainable classifier
-    4. Optimizer state
-    5. Training configuration
-    6. AAPD label vocabulary
+        1. Frozen pretrained BERT
+        2. Tokenizer
+        3. Trainable classifier
+        4. Optimizer state
+        5. Training configuration
+        6. AAPD label vocabulary
+        7. Optional best-model metadata
     """
 
-    checkpoint_dir = (
-        CHECKPOINT_DIR
-        / f"epoch_{epoch}_batch_{total_batches}"
-    )
+    checkpoint_dir = Path(checkpoint_dir)
 
     checkpoint_dir.mkdir(
         parents=True,
@@ -431,13 +401,8 @@ def save_checkpoint(
     )
 
     print()
-    print(
-        "Saving checkpoint to:"
-    )
-
-    print(
-        checkpoint_dir
-    )
+    print("Saving checkpoint to:")
+    print(checkpoint_dir)
 
     # --------------------------------------------------------
     # Save BERT
@@ -465,45 +430,33 @@ def save_checkpoint(
     )
 
     # --------------------------------------------------------
-    # Save training state
+    # Save complete classifier + optimizer checkpoint
     # --------------------------------------------------------
 
     training_state = {
-
         "epoch": epoch,
-
         "total_batches": total_batches,
-
         "average_loss": average_loss,
-
         "learning_rate": LEARNING_RATE,
-
         "batch_size": BATCH_SIZE,
-
         "max_length": MAX_LENGTH,
-
         "max_train_batches": MAX_TRAIN_BATCHES,
-
         "threshold": THRESHOLD,
-
         "num_labels": len(labels),
-
         "labels": labels,
-
         "bert_frozen": True,
-
-        "optimizer_state_dict":
-            optimizer.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
     }
+
+    if extra_state is not None:
+        training_state.update(extra_state)
 
     torch.save(
         training_state,
         checkpoint_dir / "training_state.pt",
     )
 
-    print(
-        "Checkpoint saved successfully."
-    )
+    print("Checkpoint saved successfully.")
 
     return checkpoint_dir
 
@@ -518,28 +471,33 @@ def evaluate(
     test_csv,
     label_to_id,
     num_labels,
+    labels,
+    show_header=True,
 ):
     """
-    Evaluate trained classifier on AAPD test set.
+    Evaluate the classifier.
+
+    Returns:
+        metrics:
+            Aggregate metrics.
+        per_label_f1:
+            Dictionary mapping label -> F1.
     """
 
-    print()
-    print("=" * 70)
-    print(
-        "AAPD TEST EVALUATION"
-    )
-    print("=" * 70)
+    if show_header:
+        print()
+        print("=" * 70)
+        print("AAPD TEST EVALUATION")
+        print("=" * 70)
 
     model.eval()
 
     all_predictions = []
-
     all_targets = []
 
     criterion = nn.BCEWithLogitsLoss()
 
     total_loss = 0.0
-
     batch_count = 0
 
     batches = read_batches(
@@ -562,12 +520,9 @@ def evaluate(
 
     with torch.no_grad():
 
-        for texts, labels in progress:
+        for texts, label_strings in progress:
 
-            # ------------------------------------------------
             # Tokenization
-            # ------------------------------------------------
-
             encoded = tokenizer(
                 texts,
                 padding=True,
@@ -586,46 +541,29 @@ def evaluate(
                 .to(DEVICE)
             )
 
-            # ------------------------------------------------
             # Targets
-            # ------------------------------------------------
-
             targets = encode_labels(
-                labels,
+                label_strings,
                 label_to_id,
                 num_labels,
-            )
+            ).to(DEVICE)
 
-            targets = targets.to(
-                DEVICE
-            )
-
-            # ------------------------------------------------
             # Forward
-            # ------------------------------------------------
-
             logits = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
             )
 
-            # ------------------------------------------------
             # Loss
-            # ------------------------------------------------
-
             loss = criterion(
                 logits,
                 targets,
             )
 
             total_loss += loss.item()
-
             batch_count += 1
 
-            # ------------------------------------------------
             # Predictions
-            # ------------------------------------------------
-
             probabilities = torch.sigmoid(
                 logits
             )
@@ -650,10 +588,6 @@ def evaluate(
                 ),
             )
 
-    # ========================================================
-    # Concatenate
-    # ========================================================
-
     y_pred = torch.cat(
         all_predictions,
         dim=0,
@@ -664,18 +598,14 @@ def evaluate(
         dim=0,
     ).numpy()
 
-    # ========================================================
-    # Test loss
-    # ========================================================
-
     average_test_loss = (
         total_loss
         / max(1, batch_count)
     )
 
-    # ========================================================
-    # F1
-    # ========================================================
+    # --------------------------------------------------------
+    # Aggregate metrics
+    # --------------------------------------------------------
 
     micro_f1 = f1_score(
         y_true,
@@ -698,10 +628,6 @@ def evaluate(
         zero_division=0,
     )
 
-    # ========================================================
-    # Precision
-    # ========================================================
-
     micro_precision = precision_score(
         y_true,
         y_pred,
@@ -716,9 +642,12 @@ def evaluate(
         zero_division=0,
     )
 
-    # ========================================================
-    # Recall
-    # ========================================================
+    weighted_precision = precision_score(
+        y_true,
+        y_pred,
+        average="weighted",
+        zero_division=0,
+    )
 
     micro_recall = recall_score(
         y_true,
@@ -734,136 +663,504 @@ def evaluate(
         zero_division=0,
     )
 
-    # ========================================================
-    # Hamming Loss
-    # ========================================================
+    weighted_recall = recall_score(
+        y_true,
+        y_pred,
+        average="weighted",
+        zero_division=0,
+    )
 
     hamming = hamming_loss(
         y_true,
         y_pred,
     )
 
-    # ========================================================
-    # Results
-    # ========================================================
+    # --------------------------------------------------------
+    # Per-label F1
+    # --------------------------------------------------------
 
-    metrics = {
+    per_label_f1_values = f1_score(
+        y_true,
+        y_pred,
+        average=None,
+        zero_division=0,
+    )
 
-        "test_loss":
-            average_test_loss,
-
-        "micro_f1":
-            micro_f1,
-
-        "macro_f1":
-            macro_f1,
-
-        "weighted_f1":
-            weighted_f1,
-
-        "micro_precision":
-            micro_precision,
-
-        "macro_precision":
-            macro_precision,
-
-        "micro_recall":
-            micro_recall,
-
-        "macro_recall":
-            macro_recall,
-
-        "hamming_loss":
-            hamming,
+    per_label_f1 = {
+        label: float(score)
+        for label, score in zip(
+            labels,
+            per_label_f1_values,
+        )
     }
 
-    # ========================================================
+    metrics = {
+        "test_loss": float(average_test_loss),
+
+        "micro_f1": float(micro_f1),
+        "macro_f1": float(macro_f1),
+        "weighted_f1": float(weighted_f1),
+
+        "micro_precision": float(micro_precision),
+        "macro_precision": float(macro_precision),
+        "weighted_precision": float(weighted_precision),
+
+        "micro_recall": float(micro_recall),
+        "macro_recall": float(macro_recall),
+        "weighted_recall": float(weighted_recall),
+
+        "hamming_loss": float(hamming),
+    }
+
+    # --------------------------------------------------------
     # Print results
-    # ========================================================
+    # --------------------------------------------------------
 
     print()
     print("-" * 70)
-    print(
-        "TEST RESULTS"
-    )
+    print("TEST RESULTS")
     print("-" * 70)
 
-    print(
-        f"Test Loss       : "
-        f"{average_test_loss:.6f}"
-    )
+    print(f"Test Loss       : {average_test_loss:.6f}")
+    print(f"Micro F1        : {micro_f1:.6f}")
+    print(f"Macro F1        : {macro_f1:.6f}")
+    print(f"Weighted F1     : {weighted_f1:.6f}")
 
-    print(
-        f"Micro F1        : "
-        f"{micro_f1:.6f}"
-    )
+    print(f"Micro Precision : {micro_precision:.6f}")
+    print(f"Macro Precision : {macro_precision:.6f}")
+    print(f"Weighted Prec.  : {weighted_precision:.6f}")
 
-    print(
-        f"Macro F1        : "
-        f"{macro_f1:.6f}"
-    )
+    print(f"Micro Recall    : {micro_recall:.6f}")
+    print(f"Macro Recall    : {macro_recall:.6f}")
+    print(f"Weighted Recall : {weighted_recall:.6f}")
 
-    print(
-        f"Weighted F1     : "
-        f"{weighted_f1:.6f}"
-    )
-
-    print(
-        f"Micro Precision : "
-        f"{micro_precision:.6f}"
-    )
-
-    print(
-        f"Macro Precision : "
-        f"{macro_precision:.6f}"
-    )
-
-    print(
-        f"Micro Recall    : "
-        f"{micro_recall:.6f}"
-    )
-
-    print(
-        f"Macro Recall    : "
-        f"{macro_recall:.6f}"
-    )
-
-    print(
-        f"Hamming Loss    : "
-        f"{hamming:.6f}"
-    )
-
-    print(
-        f"Threshold       : "
-        f"{THRESHOLD}"
-    )
-
-    print(
-        f"Test samples    : "
-        f"{len(y_true):,}"
-    )
-
-    print(
-        f"Number of labels: "
-        f"{num_labels}"
-    )
+    print(f"Hamming Loss    : {hamming:.6f}")
+    print(f"Threshold       : {THRESHOLD}")
+    print(f"Test samples    : {len(y_true):,}")
+    print(f"Number of labels: {num_labels}")
 
     print("-" * 70)
 
-    return metrics
+    return metrics, per_label_f1
 
 
 # ============================================================
-# Save evaluation results
+# Save epoch metrics
+# ============================================================
+
+def save_epoch_metrics(
+    history,
+):
+    """
+    Save aggregate metrics for every epoch to CSV and JSON.
+    """
+
+    if not history:
+        return
+
+    csv_file = METRICS_DIR / "epoch_metrics.csv"
+    json_file = METRICS_DIR / "epoch_metrics.json"
+
+    fieldnames = list(history[0].keys())
+
+    with csv_file.open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+        )
+
+        writer.writeheader()
+        writer.writerows(history)
+
+    with json_file.open(
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            history,
+            f,
+            indent=2,
+        )
+
+    print()
+    print("Epoch metrics saved to:")
+    print(csv_file)
+    print(json_file)
+
+
+# ============================================================
+# Save per-label F1
+# ============================================================
+
+def save_per_label_f1(
+    per_label_f1,
+    epoch=None,
+):
+    """
+    Save per-label F1 sorted from highest to lowest.
+    """
+
+    if epoch is None:
+        filename = "per_label_f1_final.csv"
+    else:
+        filename = (
+            f"per_label_f1_epoch_{epoch}.csv"
+        )
+
+    output_file = METRICS_DIR / filename
+
+    sorted_items = sorted(
+        per_label_f1.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    with output_file.open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "rank",
+            "label",
+            "f1",
+        ])
+
+        for rank, (label, score) in enumerate(
+            sorted_items,
+            start=1,
+        ):
+
+            writer.writerow([
+                rank,
+                label,
+                f"{score:.6f}",
+            ])
+
+    return output_file
+
+
+# ============================================================
+# Print per-label F1
+# ============================================================
+
+def print_per_label_f1(
+    per_label_f1,
+):
+    """Print per-label F1 sorted descending."""
+
+    sorted_items = sorted(
+        per_label_f1.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    print()
+    print("=" * 70)
+    print("FINAL PER-LABEL F1 — SORTED DESCENDING")
+    print("=" * 70)
+
+    print(
+        f"{'Rank':<8}"
+        f"{'Label':<20}"
+        f"{'F1':>10}"
+    )
+
+    print("-" * 70)
+
+    for rank, (label, score) in enumerate(
+        sorted_items,
+        start=1,
+    ):
+
+        print(
+            f"{rank:<8}"
+            f"{label:<20}"
+            f"{score:>10.6f}"
+        )
+
+    print("=" * 70)
+
+
+# ============================================================
+# Plot training/evaluation metrics
+# ============================================================
+
+def plot_training_metrics(
+    history,
+):
+    """
+    Save charts showing metrics versus epoch.
+
+    Charts:
+        1. Loss
+        2. F1
+        3. Precision
+        4. Recall
+        5. Hamming loss
+    """
+
+    if not history:
+        return
+
+    epochs = [
+        row["epoch"]
+        for row in history
+    ]
+
+    # --------------------------------------------------------
+    # Loss
+    # --------------------------------------------------------
+
+    plt.figure(figsize=(10, 6))
+
+    plt.plot(
+        epochs,
+        [
+            row["train_loss"]
+            for row in history
+        ],
+        marker="o",
+        label="Train Loss",
+    )
+
+    plt.plot(
+        epochs,
+        [
+            row["test_loss"]
+            for row in history
+        ],
+        marker="o",
+        label="Test Loss",
+    )
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Loss vs Epoch")
+    plt.xticks(epochs)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(
+        PLOTS_DIR / "loss_vs_epoch.png",
+        dpi=200,
+    )
+
+    plt.close()
+
+    # --------------------------------------------------------
+    # F1
+    # --------------------------------------------------------
+
+    plt.figure(figsize=(10, 6))
+
+    plt.plot(
+        epochs,
+        [
+            row["micro_f1"]
+            for row in history
+        ],
+        marker="o",
+        label="Micro F1",
+    )
+
+    plt.plot(
+        epochs,
+        [
+            row["macro_f1"]
+            for row in history
+        ],
+        marker="o",
+        label="Macro F1",
+    )
+
+    plt.plot(
+        epochs,
+        [
+            row["weighted_f1"]
+            for row in history
+        ],
+        marker="o",
+        label="Weighted F1",
+    )
+
+    plt.xlabel("Epoch")
+    plt.ylabel("F1")
+    plt.title("F1 vs Epoch")
+    plt.xticks(epochs)
+    plt.ylim(0, 1)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(
+        PLOTS_DIR / "f1_vs_epoch.png",
+        dpi=200,
+    )
+
+    plt.close()
+
+    # --------------------------------------------------------
+    # Precision
+    # --------------------------------------------------------
+
+    plt.figure(figsize=(10, 6))
+
+    plt.plot(
+        epochs,
+        [
+            row["micro_precision"]
+            for row in history
+        ],
+        marker="o",
+        label="Micro Precision",
+    )
+
+    plt.plot(
+        epochs,
+        [
+            row["macro_precision"]
+            for row in history
+        ],
+        marker="o",
+        label="Macro Precision",
+    )
+
+    plt.plot(
+        epochs,
+        [
+            row["weighted_precision"]
+            for row in history
+        ],
+        marker="o",
+        label="Weighted Precision",
+    )
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Precision")
+    plt.title("Precision vs Epoch")
+    plt.xticks(epochs)
+    plt.ylim(0, 1)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(
+        PLOTS_DIR / "precision_vs_epoch.png",
+        dpi=200,
+    )
+
+    plt.close()
+
+    # --------------------------------------------------------
+    # Recall
+    # --------------------------------------------------------
+
+    plt.figure(figsize=(10, 6))
+
+    plt.plot(
+        epochs,
+        [
+            row["micro_recall"]
+            for row in history
+        ],
+        marker="o",
+        label="Micro Recall",
+    )
+
+    plt.plot(
+        epochs,
+        [
+            row["macro_recall"]
+            for row in history
+        ],
+        marker="o",
+        label="Macro Recall",
+    )
+
+    plt.plot(
+        epochs,
+        [
+            row["weighted_recall"]
+            for row in history
+        ],
+        marker="o",
+        label="Weighted Recall",
+    )
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Recall")
+    plt.title("Recall vs Epoch")
+    plt.xticks(epochs)
+    plt.ylim(0, 1)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(
+        PLOTS_DIR / "recall_vs_epoch.png",
+        dpi=200,
+    )
+
+    plt.close()
+
+    # --------------------------------------------------------
+    # Hamming loss
+    # --------------------------------------------------------
+
+    plt.figure(figsize=(10, 6))
+
+    plt.plot(
+        epochs,
+        [
+            row["hamming_loss"]
+            for row in history
+        ],
+        marker="o",
+        label="Hamming Loss",
+    )
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Hamming Loss")
+    plt.title("Hamming Loss vs Epoch")
+    plt.xticks(epochs)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(
+        PLOTS_DIR / "hamming_loss_vs_epoch.png",
+        dpi=200,
+    )
+
+    plt.close()
+
+    print()
+    print("Metric charts saved to:")
+    print(PLOTS_DIR)
+
+
+# ============================================================
+# Save final evaluation results
 # ============================================================
 
 def save_evaluation_results(
     checkpoint_dir,
     metrics,
 ):
-    """
-    Save evaluation metrics as a text file.
-    """
+    """Save final aggregate evaluation metrics."""
+
+    checkpoint_dir = Path(checkpoint_dir)
 
     evaluation_file = (
         checkpoint_dir
@@ -879,10 +1176,7 @@ def save_evaluation_results(
             "AAPD BERT Evaluation Results\n"
         )
 
-        f.write(
-            "=" * 60
-            + "\n"
-        )
+        f.write("=" * 60 + "\n")
 
         for name, value in metrics.items():
 
@@ -912,13 +1206,8 @@ def save_evaluation_results(
         )
 
     print()
-    print(
-        "Evaluation results saved to:"
-    )
-
-    print(
-        evaluation_file
-    )
+    print("Evaluation results saved to:")
+    print(evaluation_file)
 
 
 # ============================================================
@@ -928,75 +1217,43 @@ def save_evaluation_results(
 def main():
 
     print("=" * 70)
-
     print(
         "AAPD BERT Feature Extraction "
         "+ Multi-Label Classifier"
     )
-
     print("=" * 70)
 
-    print(
-        f"Device: {DEVICE}"
-    )
-
-    print(
-        f"Train CSV: {TRAIN_CSV}"
-    )
-
-    print(
-        f"Test CSV: {TEST_CSV}"
-    )
-
-    print(
-        f"Checkpoint directory: "
-        f"{CHECKPOINT_DIR}"
-    )
+    print(f"Device: {DEVICE}")
+    print(f"Train CSV: {TRAIN_CSV}")
+    print(f"Test CSV: {TEST_CSV}")
+    print(f"Checkpoint directory: {CHECKPOINT_DIR}")
 
     print()
-    print(
-        "BERT training: DISABLED"
-    )
-
-    print(
-        "Classifier training: ENABLED"
-    )
+    print("BERT training: DISABLED")
+    print("Classifier training: ENABLED")
 
     print()
-    print(
-        f"Batch size: {BATCH_SIZE}"
-    )
-
-    print(
-        f"Epochs: {EPOCHS}"
-    )
-
+    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Epochs: {EPOCHS}")
     print(
         f"Maximum training batches: "
         f"{MAX_TRAIN_BATCHES}"
     )
-
-    print(
-        f"Learning rate: {LEARNING_RATE}"
-    )
-
-    print(
-        f"Threshold: {THRESHOLD}"
-    )
+    print(f"Learning rate: {LEARNING_RATE}")
+    print(f"Threshold: {THRESHOLD}")
+    print(f"Best-model metric: {BEST_METRIC}")
 
     # ========================================================
     # Validate files
     # ========================================================
 
     if not TRAIN_CSV.exists():
-
         raise FileNotFoundError(
             f"Training CSV not found:\n"
             f"{TRAIN_CSV}"
         )
 
     if not TEST_CSV.exists():
-
         raise FileNotFoundError(
             f"Test CSV not found:\n"
             f"{TEST_CSV}"
@@ -1007,18 +1264,12 @@ def main():
     # ========================================================
 
     print()
-    print(
-        "Calculating training batches..."
-    )
+    print("Calculating training batches...")
 
     total_dataset_batches = count_batches(
         TRAIN_CSV,
         BATCH_SIZE,
     )
-
-    # --------------------------------------------------------
-    # Determine total training batches
-    # --------------------------------------------------------
 
     if MAX_TRAIN_BATCHES is None:
 
@@ -1034,7 +1285,6 @@ def main():
             total_dataset_batches * EPOCHS,
         )
 
-    print()
     print(
         f"Dataset batches per epoch : "
         f"{total_dataset_batches:,}"
@@ -1055,40 +1305,34 @@ def main():
     # ========================================================
 
     print()
-    print(
-        "Discovering AAPD labels..."
-    )
+    print("Discovering AAPD labels...")
 
-    LABELS = discover_labels(
+    labels = discover_labels(
         TRAIN_CSV
     )
 
-    NUM_LABELS = len(
-        LABELS
-    )
+    num_labels = len(labels)
 
-    LABEL_TO_ID = {
+    label_to_id = {
         label: idx
-        for idx, label in enumerate(LABELS)
+        for idx, label in enumerate(labels)
     }
 
     print(
         f"Number of labels: "
-        f"{NUM_LABELS}"
+        f"{num_labels}"
     )
 
     print()
     print("Labels:")
-    print(LABELS)
+    print(labels)
 
     # ========================================================
     # Tokenizer
     # ========================================================
 
     print()
-    print(
-        "Loading tokenizer..."
-    )
+    print("Loading tokenizer...")
 
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_NAME
@@ -1098,13 +1342,11 @@ def main():
     # Model
     # ========================================================
 
-    print(
-        "Loading BERT model..."
-    )
+    print("Loading BERT model...")
 
     model = BertMultiLabelClassifier(
         MODEL_NAME,
-        NUM_LABELS,
+        num_labels,
     )
 
     model.to(DEVICE)
@@ -1126,9 +1368,7 @@ def main():
     )
 
     print()
-    print(
-        "Trainable parameter check:"
-    )
+    print("Trainable parameter check:")
 
     print(
         f"BERT trainable parameters: "
@@ -1141,13 +1381,11 @@ def main():
     )
 
     if bert_trainable_params != 0:
-
         raise RuntimeError(
             "BERT is not completely frozen!"
         )
 
     if classifier_trainable_params == 0:
-
         raise RuntimeError(
             "Classifier has no trainable parameters!"
         )
@@ -1168,18 +1406,30 @@ def main():
     criterion = nn.BCEWithLogitsLoss()
 
     # ========================================================
-    # Training counters
+    # Training state
     # ========================================================
 
     global_batch_count = 0
-
-    training_finished = False
-
     last_epoch = 0
-
     last_average_loss = 0.0
 
-    checkpoint_dir = None
+    history = []
+
+    best_metric_value = (
+        float("-inf")
+        if BEST_MODE == "max"
+        else float("inf")
+    )
+
+    best_epoch = None
+    best_checkpoint_dir = (
+        CHECKPOINT_DIR / "best_model"
+    )
+
+    # Remove previous best checkpoint so an old model cannot
+    # accidentally be reported as the new best model.
+    if best_checkpoint_dir.exists():
+        shutil.rmtree(best_checkpoint_dir)
 
     # ========================================================
     # Training
@@ -1189,54 +1439,31 @@ def main():
 
         last_epoch = epoch + 1
 
+        # If the global training limit has already been reached,
+        # stop instead of creating empty epochs.
+        if (
+            MAX_TRAIN_BATCHES is not None
+            and global_batch_count >= MAX_TRAIN_BATCHES
+        ):
+            break
+
         model.train()
 
-        # ----------------------------------------------------
         # BERT explicitly stays in evaluation mode
-        # ----------------------------------------------------
-
         model.bert.eval()
 
         total_loss = 0.0
-
         epoch_batch_count = 0
-
-        # ----------------------------------------------------
-        # Epoch information
-        # ----------------------------------------------------
-
-        epochs_remaining = (
-            EPOCHS
-            - (epoch + 1)
-        )
-
-        batches_remaining_global = (
-            total_training_batches
-            - global_batch_count
-        )
 
         print()
         print("=" * 70)
-
         print(
             f"Epoch {epoch + 1}/{EPOCHS}"
         )
-
-        print(
-            f"Epochs remaining: "
-            f"{epochs_remaining}"
-        )
-
         print(
             f"Global batches completed: "
             f"{global_batch_count}"
         )
-
-        print(
-            f"Global batches remaining: "
-            f"{batches_remaining_global}"
-        )
-
         print("=" * 70)
 
         batches = read_batches(
@@ -1258,7 +1485,7 @@ def main():
         # Batch loop
         # ====================================================
 
-        for texts, labels in progress:
+        for texts, label_strings in progress:
 
             # ------------------------------------------------
             # Check maximum number of batches
@@ -1269,11 +1496,6 @@ def main():
                 and global_batch_count
                 >= MAX_TRAIN_BATCHES
             ):
-
-                training_finished = True
-
-                progress.close()
-
                 break
 
             # ------------------------------------------------
@@ -1303,14 +1525,10 @@ def main():
             # ------------------------------------------------
 
             targets = encode_labels(
-                labels,
-                LABEL_TO_ID,
-                NUM_LABELS,
-            )
-
-            targets = targets.to(
-                DEVICE
-            )
+                label_strings,
+                label_to_id,
+                num_labels,
+            ).to(DEVICE)
 
             # ------------------------------------------------
             # Forward
@@ -1353,9 +1571,7 @@ def main():
             loss_value = loss.item()
 
             total_loss += loss_value
-
             epoch_batch_count += 1
-
             global_batch_count += 1
 
             average_running_loss = (
@@ -1363,93 +1579,23 @@ def main():
                 / epoch_batch_count
             )
 
-            # ------------------------------------------------
-            # Remaining batches
-            # ------------------------------------------------
-
-            remaining_global_batches = (
-                total_training_batches
-                - global_batch_count
-            )
-
-            # ------------------------------------------------
-            # Remaining batches in current epoch
-            # ------------------------------------------------
-
-            remaining_epoch_batches = max(
-                0,
-                total_dataset_batches
-                - epoch_batch_count,
-            )
-
-            # ------------------------------------------------
-            # Epochs remaining
-            # ------------------------------------------------
-
-            current_epochs_remaining = (
-                EPOCHS
-                - (epoch + 1)
-            )
-
-            # ------------------------------------------------
-            # Global progress percentage
-            # ------------------------------------------------
-
             progress_percent = (
                 global_batch_count
-                / total_training_batches
+                / max(1, total_training_batches)
                 * 100
             )
 
-            # ------------------------------------------------
-            # Update tqdm
-            # ------------------------------------------------
-
             progress.set_postfix(
-                done=(
-                    f"{global_batch_count:,}"
-                ),
-                remaining=(
-                    f"{remaining_global_batches:,}"
-                ),
-                epoch_done=(
-                    f"{epoch_batch_count:,}"
-                ),
-                epoch_remaining=(
-                    f"{remaining_epoch_batches:,}"
-                ),
-                epochs_left=(
-                    f"{current_epochs_remaining:,}"
-                ),
-                progress=(
-                    f"{progress_percent:.1f}%"
-                ),
-                loss=(
-                    f"{loss_value:.4f}"
-                ),
-                avg_loss=(
-                    f"{average_running_loss:.4f}"
-                ),
+                done=f"{global_batch_count:,}",
+                progress=f"{progress_percent:.1f}%",
+                loss=f"{loss_value:.4f}",
+                avg_loss=f"{average_running_loss:.4f}",
             )
 
-            # ------------------------------------------------
-            # Stop after maximum batch limit
-            # ------------------------------------------------
-
-            if (
-                MAX_TRAIN_BATCHES is not None
-                and global_batch_count
-                >= MAX_TRAIN_BATCHES
-            ):
-
-                training_finished = True
-
-                progress.close()
-
-                break
+        progress.close()
 
         # ====================================================
-        # Epoch statistics
+        # Epoch training statistics
         # ====================================================
 
         average_loss = (
@@ -1462,150 +1608,200 @@ def main():
 
         last_average_loss = average_loss
 
-        # ----------------------------------------------------
-        # Remaining global batches
-        # ----------------------------------------------------
+        print()
+        print("-" * 70)
+        print(
+            f"Epoch {epoch + 1} training completed"
+        )
+        print(
+            f"Epoch batches : "
+            f"{epoch_batch_count:,}"
+        )
+        print(
+            f"Total batches : "
+            f"{global_batch_count:,}"
+        )
+        print(
+            f"Train loss    : "
+            f"{average_loss:.6f}"
+        )
+        print("-" * 70)
 
-        remaining_global_batches = (
-            total_training_batches
-            - global_batch_count
+        # ====================================================
+        # Evaluate after EVERY epoch
+        # ====================================================
+
+        epoch_metrics, epoch_per_label_f1 = evaluate(
+            model=model,
+            tokenizer=tokenizer,
+            test_csv=TEST_CSV,
+            label_to_id=label_to_id,
+            num_labels=num_labels,
+            labels=labels,
+            show_header=True,
         )
 
-        # ----------------------------------------------------
-        # Overall progress
-        # ----------------------------------------------------
-
-        progress_percent = (
-            global_batch_count
-            / total_training_batches
-            * 100
+        # Save per-label F1 for this epoch
+        epoch_per_label_file = save_per_label_f1(
+            epoch_per_label_f1,
+            epoch=epoch + 1,
         )
+
+        # ====================================================
+        # Record epoch history
+        # ====================================================
+
+        history_row = {
+            "epoch": epoch + 1,
+            "train_loss": float(average_loss),
+            "train_batches": int(epoch_batch_count),
+            "total_batches": int(global_batch_count),
+        }
+
+        history_row.update(epoch_metrics)
+
+        history.append(history_row)
+
+        # Save metrics immediately after the epoch.
+        save_epoch_metrics(history)
 
         print()
         print(
-            "-" * 70
+            f"Epoch {epoch + 1} metrics saved."
         )
-
         print(
-            f"Epoch {epoch + 1} completed"
-        )
-
-        print(
-            f"Epoch batches completed : "
-            f"{epoch_batch_count:,}"
-        )
-
-        print(
-            f"Epoch batches total     : "
-            f"{total_dataset_batches:,}"
-        )
-
-        print(
-            f"Epoch batches remaining : "
-            f"{max(0, total_dataset_batches - epoch_batch_count):,}"
-        )
-
-        print(
-            f"Epochs remaining        : "
-            f"{EPOCHS - (epoch + 1):,}"
-        )
-
-        print(
-            f"Total batches completed : "
-            f"{global_batch_count:,}"
-        )
-
-        print(
-            f"Total batches remaining : "
-            f"{remaining_global_batches:,}"
-        )
-
-        print(
-            f"Overall progress        : "
-            f"{progress_percent:.2f}%"
-        )
-
-        print(
-            f"Average Loss            : "
-            f"{average_loss:.6f}"
-        )
-
-        print(
-            "-" * 70
+            f"Per-label F1 saved to: "
+            f"{epoch_per_label_file}"
         )
 
         # ====================================================
-        # Maximum batch limit reached
+        # Save normal epoch checkpoint
         # ====================================================
 
-        if training_finished:
+        epoch_checkpoint_dir = (
+            CHECKPOINT_DIR
+            / f"epoch_{epoch + 1}"
+        )
 
-            print()
-            print(
-                "=" * 70
-            )
-
-            print(
-                "MAXIMUM TRAINING BATCHES REACHED"
-            )
-
-            print(
-                f"Maximum batches: "
-                f"{MAX_TRAIN_BATCHES:,}"
-            )
-
-            print(
-                f"Actual batches: "
-                f"{global_batch_count:,}"
-            )
-
-            print(
-                f"Remaining batches: "
-                f"{remaining_global_batches:,}"
-            )
-
-            print(
-                f"Overall progress: "
-                f"{progress_percent:.2f}%"
-            )
-
-            print(
-                "Training stopped."
-            )
-
-            print(
-                "=" * 70
-            )
-
-            # ------------------------------------------------
-            # Save checkpoint
-            # ------------------------------------------------
-
-            checkpoint_dir = save_checkpoint(
-                model=model,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                epoch=epoch + 1,
-                total_batches=global_batch_count,
-                average_loss=average_loss,
-                labels=LABELS,
-            )
-
-            break
-
-        # ====================================================
-        # Normal epoch completion
-        # ====================================================
-
-        checkpoint_dir = save_checkpoint(
+        save_checkpoint(
             model=model,
             tokenizer=tokenizer,
             optimizer=optimizer,
             epoch=epoch + 1,
             total_batches=global_batch_count,
             average_loss=average_loss,
-            labels=LABELS,
+            labels=labels,
+            checkpoint_dir=epoch_checkpoint_dir,
+            extra_state={
+                "epoch_metrics": epoch_metrics,
+                "best_metric_name": BEST_METRIC,
+            },
         )
+
+        # ====================================================
+        # Best-model check
+        # ====================================================
+
+        current_metric = epoch_metrics[
+            BEST_METRIC
+        ]
+
+        if BEST_MODE == "max":
+            is_better = (
+                current_metric
+                > best_metric_value
+            )
+        else:
+            is_better = (
+                current_metric
+                < best_metric_value
+            )
+
+        if is_better:
+
+            best_metric_value = current_metric
+            best_epoch = epoch + 1
+
+            # Remove previous best model.
+            if best_checkpoint_dir.exists():
+                shutil.rmtree(
+                    best_checkpoint_dir
+                )
+
+            save_checkpoint(
+                model=model,
+                tokenizer=tokenizer,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                total_batches=global_batch_count,
+                average_loss=average_loss,
+                labels=labels,
+                checkpoint_dir=best_checkpoint_dir,
+                extra_state={
+                    "best_model": True,
+                    "best_metric_name": BEST_METRIC,
+                    "best_metric_value": float(
+                        best_metric_value
+                    ),
+                    "best_epoch": best_epoch,
+                    "epoch_metrics": epoch_metrics,
+                },
+            )
+
+            print()
+            print("=" * 70)
+            print("NEW BEST MODEL")
+            print("=" * 70)
+            print(
+                f"Metric : {BEST_METRIC}"
+            )
+            print(
+                f"Value  : "
+                f"{best_metric_value:.6f}"
+            )
+            print(
+                f"Epoch  : {best_epoch}"
+            )
+            print(
+                f"Saved  : {best_checkpoint_dir}"
+            )
+            print("=" * 70)
+
+        else:
+
+            print()
+            print(
+                f"Best model unchanged. "
+                f"Current {BEST_METRIC}: "
+                f"{current_metric:.6f}, "
+                f"best: "
+                f"{best_metric_value:.6f}"
+            )
+
+        # ====================================================
+        # Stop after maximum batch limit
+        # ====================================================
+
+        if (
+            MAX_TRAIN_BATCHES is not None
+            and global_batch_count
+            >= MAX_TRAIN_BATCHES
+        ):
+            print()
+            print("=" * 70)
+            print("MAXIMUM TRAINING BATCHES REACHED")
+            print("=" * 70)
+            print(
+                f"Maximum batches: "
+                f"{MAX_TRAIN_BATCHES:,}"
+            )
+            print(
+                f"Actual batches: "
+                f"{global_batch_count:,}"
+            )
+            print("Training stopped.")
+            print("=" * 70)
+            break
 
     # ========================================================
     # Training finished
@@ -1613,21 +1809,8 @@ def main():
 
     print()
     print("=" * 70)
-    print(
-        "TRAINING COMPLETED"
-    )
+    print("TRAINING COMPLETED")
     print("=" * 70)
-
-    final_remaining_batches = (
-        total_training_batches
-        - global_batch_count
-    )
-
-    final_progress = (
-        global_batch_count
-        / total_training_batches
-        * 100
-    )
 
     print(
         f"Final epoch: "
@@ -1637,16 +1820,6 @@ def main():
     print(
         f"Total training batches: "
         f"{global_batch_count:,}"
-    )
-
-    print(
-        f"Remaining batches: "
-        f"{final_remaining_batches:,}"
-    )
-
-    print(
-        f"Overall progress: "
-        f"{final_progress:.2f}%"
     )
 
     print(
@@ -1663,26 +1836,99 @@ def main():
     )
 
     # ========================================================
-    # Evaluation
+    # Final charts
     # ========================================================
 
-    metrics = evaluate(
-        model=model,
-        tokenizer=tokenizer,
-        test_csv=TEST_CSV,
-        label_to_id=LABEL_TO_ID,
-        num_labels=NUM_LABELS,
+    plot_training_metrics(
+        history
     )
 
     # ========================================================
-    # Save evaluation results
+    # Final evaluation
+    #
+    # Evaluate the BEST model, not simply the last epoch.
     # ========================================================
 
-    if checkpoint_dir is not None:
+    if best_epoch is not None:
 
-        save_evaluation_results(
-            checkpoint_dir=checkpoint_dir,
-            metrics=metrics,
+        print()
+        print("=" * 70)
+        print(
+            "LOADING BEST MODEL FOR FINAL EVALUATION"
+        )
+        print("=" * 70)
+
+        classifier_path = (
+            best_checkpoint_dir
+            / "classifier.pt"
+        )
+
+        if not classifier_path.exists():
+            raise FileNotFoundError(
+                f"Best classifier not found:\n"
+                f"{classifier_path}"
+            )
+
+        model.classifier.load_state_dict(
+            torch.load(
+                classifier_path,
+                map_location=DEVICE,
+            )
+        )
+
+        model.to(DEVICE)
+
+    final_metrics, final_per_label_f1 = evaluate(
+        model=model,
+        tokenizer=tokenizer,
+        test_csv=TEST_CSV,
+        label_to_id=label_to_id,
+        num_labels=num_labels,
+        labels=labels,
+        show_header=True,
+    )
+
+    # ========================================================
+    # Save final results
+    # ========================================================
+
+    final_per_label_file = save_per_label_f1(
+        final_per_label_f1
+    )
+
+    print_per_label_f1(
+        final_per_label_f1
+    )
+
+    # Save final aggregate metrics.
+    save_evaluation_results(
+        checkpoint_dir=best_checkpoint_dir,
+        metrics=final_metrics,
+    )
+
+    # Save final JSON summary.
+    final_summary = {
+        "best_epoch": best_epoch,
+        "best_metric_name": BEST_METRIC,
+        "best_metric_value": best_metric_value,
+        "final_metrics": final_metrics,
+        "final_per_label_f1": final_per_label_f1,
+    }
+
+    final_summary_file = (
+        METRICS_DIR
+        / "final_summary.json"
+    )
+
+    with final_summary_file.open(
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            final_summary,
+            f,
+            indent=2,
         )
 
     # ========================================================
@@ -1696,20 +1942,9 @@ def main():
     )
     print("=" * 70)
 
-    print()
     print(
         f"Training batches : "
         f"{global_batch_count:,}"
-    )
-
-    print(
-        f"Remaining batches: "
-        f"{final_remaining_batches:,}"
-    )
-
-    print(
-        f"Overall progress : "
-        f"{final_progress:.2f}%"
     )
 
     print(
@@ -1719,54 +1954,80 @@ def main():
 
     print()
     print(
-        f"Test loss        : "
-        f"{metrics['test_loss']:.6f}"
+        f"Best epoch       : "
+        f"{best_epoch}"
     )
 
     print(
-        f"Micro F1         : "
-        f"{metrics['micro_f1']:.6f}"
-    )
-
-    print(
-        f"Macro F1         : "
-        f"{metrics['macro_f1']:.6f}"
-    )
-
-    print(
-        f"Weighted F1      : "
-        f"{metrics['weighted_f1']:.6f}"
-    )
-
-    print(
-        f"Micro Precision  : "
-        f"{metrics['micro_precision']:.6f}"
-    )
-
-    print(
-        f"Macro Precision  : "
-        f"{metrics['macro_precision']:.6f}"
-    )
-
-    print(
-        f"Micro Recall     : "
-        f"{metrics['micro_recall']:.6f}"
-    )
-
-    print(
-        f"Macro Recall     : "
-        f"{metrics['macro_recall']:.6f}"
-    )
-
-    print(
-        f"Hamming Loss     : "
-        f"{metrics['hamming_loss']:.6f}"
+        f"Best {BEST_METRIC:<12}: "
+        f"{best_metric_value:.6f}"
     )
 
     print()
     print(
-        f"Checkpoint: "
-        f"{checkpoint_dir}"
+        f"Final Test Loss       : "
+        f"{final_metrics['test_loss']:.6f}"
+    )
+
+    print(
+        f"Final Micro F1        : "
+        f"{final_metrics['micro_f1']:.6f}"
+    )
+
+    print(
+        f"Final Macro F1        : "
+        f"{final_metrics['macro_f1']:.6f}"
+    )
+
+    print(
+        f"Final Weighted F1     : "
+        f"{final_metrics['weighted_f1']:.6f}"
+    )
+
+    print(
+        f"Final Micro Precision : "
+        f"{final_metrics['micro_precision']:.6f}"
+    )
+
+    print(
+        f"Final Macro Precision : "
+        f"{final_metrics['macro_precision']:.6f}"
+    )
+
+    print(
+        f"Final Micro Recall    : "
+        f"{final_metrics['micro_recall']:.6f}"
+    )
+
+    print(
+        f"Final Macro Recall    : "
+        f"{final_metrics['macro_recall']:.6f}"
+    )
+
+    print(
+        f"Final Hamming Loss    : "
+        f"{final_metrics['hamming_loss']:.6f}"
+    )
+
+    print()
+    print(
+        f"Best model: "
+        f"{best_checkpoint_dir}"
+    )
+
+    print(
+        f"Epoch metrics: "
+        f"{METRICS_DIR / 'epoch_metrics.csv'}"
+    )
+
+    print(
+        f"Final per-label F1: "
+        f"{final_per_label_file}"
+    )
+
+    print(
+        f"Charts: "
+        f"{PLOTS_DIR}"
     )
 
     print("=" * 70)
@@ -1777,6 +2038,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
-
